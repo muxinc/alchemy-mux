@@ -1,3 +1,5 @@
 node_modules
 .alchemy
 .env
+dist
+*.tgz

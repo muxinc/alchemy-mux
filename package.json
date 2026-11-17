@@ -1,21 +1,37 @@
 {
-  "name": "alchemy-mux",
-  "version": "0.0.0",
+  "name": "@mux/alchemy",
+  "version": "0.1.0",
   "private": true,
-  "description": "Mux Video live streams, signing keys and playback restrictions for Alchemy.",
+  "description": "Mux resources and runtime bindings for Alchemy v2: assets, live streams, Robots, webhooks, signing keys and more.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muxinc/alchemy-mux.git"
+  },
   "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src"
+  ],
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "bun": "./src/index.ts",
-      "default": "./src/index.ts"
+      "default": "./dist/index.js"
     }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
     "deploy": "alchemy deploy example/alchemy.run.ts",
     "destroy": "alchemy destroy example/alchemy.run.ts",
     "generate": "bun scripts/generate.ts",
     "verify": "bun test/verify.ts"
+  },
+  "peerDependencies": {
+    "alchemy": "2.0.0-beta.87",
+    "effect": "^4.1.4"
   },
   "devDependencies": {
     "@effect/platform-bun": "^4.1.4",

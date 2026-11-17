@@ -68,6 +68,20 @@ async function typecheck() {
   check(tsc.code === 0, `tsc failed:\n${tsc.output}`);
 }
 
+const NODE_IMPORT = `
+const Mux = await import("@mux/alchemy");
+const missing = ["Asset", "LiveStream", "Webhook", "providers", "PlaybackSigner", "verifyWebhookSignature"]
+  .filter((name) => Mux[name] === undefined);
+if (missing.length || !Mux.Robots?.Directive) throw new Error("missing exports: " + missing.join(", "));
+`;
+
+async function packageBuild() {
+  const build = await run(["bun", "run", "build"]);
+  check(build.code === 0, `build failed:\n${build.output}`);
+  const node = await run(["node", "--input-type=module", "-e", NODE_IMPORT]);
+  check(node.code === 0, `the built package does not load under Node:\n${node.output}`);
+}
+
 async function lifecycle(scenario: Scenario, runId: string) {
   const stage = `verify-${runId}`;
   process.env.VERIFY_STAGE = stage;
@@ -179,6 +193,7 @@ try {
   await gate("1. credentials valid, non-production, video+system+robots+data write", credentials);
   await gate("2. generated types match vendored OpenAPI spec", generatedTypes);
   await gate("3. typecheck", typecheck);
+  await gate("3b. package builds and loads under Node through its exports map", packageBuild);
   await gate("4. API client behavior against a fake server", clientChecks);
   for (const scenario of selected) {
     await gate(`5. lifecycle: ${scenario.name}`, () => lifecycle(scenario, runId));

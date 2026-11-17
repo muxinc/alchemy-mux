@@ -19,7 +19,7 @@ export const bindEnvironment = Effect.fn(function* (
   owner: string,
   env: Record<string, Output.Output<EnvValue> | EnvValue>,
 ) {
-  if (globalThis.__ALCHEMY_RUNTIME__) return;
+  if ((globalThis as { __ALCHEMY_RUNTIME__?: boolean }).__ALCHEMY_RUNTIME__) return;
   const runtime = yield* CurrentRuntimeContext;
   if (!runtime) {
     return yield* Effect.die(
