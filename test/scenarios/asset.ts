@@ -150,6 +150,59 @@ export const asset_: Scenario = {
       },
     },
     {
+      name: "halfway",
+      plan: {},
+      failsWith: "static-renditions failed with 400",
+      verify: async ({ run, state }) => {
+        const live = await asset(state.asset!.id);
+        check(
+          live.meta?.title === `verify ${run} halfway`,
+          `expected the half-applied title to remain in Mux, got ${live.meta?.title}; revert would prove nothing`,
+        );
+      },
+    },
+    {
+      name: "revert",
+      plan: { directive: "noop", asset: "update" },
+      verify: async ({ run, state, previous }) => {
+        check(state.asset!.id === previous.asset!.id, "revert replaced the asset");
+        const live = await asset(state.asset!.id);
+        check(live.meta?.title === `verify ${run} v2`, `revert left title ${live.meta?.title}`);
+        check(!rendition(live, "999p"), "revert left a rendition behind");
+      },
+    },
+    {
+      name: "drift",
+      detectDrift: true,
+      plan: { directive: "noop", asset: "update" },
+      before: async ({ previous }) => {
+        const a = previous.asset!;
+        const writes = [
+          await mux("PATCH", `/video/v1/assets/${a.id}`, { meta: { title: "changed outside alchemy" } }),
+          await mux("PUT", `/video/v1/assets/${a.id}/master-access`, { master_access: "temporary" }),
+          await mux("DELETE", `/video/v1/assets/${a.id}/playback-ids/${idFor(a, "signed")}`),
+          await mux("POST", `/video/v1/assets/${a.id}/playback-ids`, { policy: "public" }),
+          await mux("DELETE", `/video/v1/assets/${a.id}/tracks/${track(a, "uploaded", "fr")[0].id}`),
+        ];
+        for (const w of writes) check(w.status < 300, `out-of-band change returned ${w.status}`);
+      },
+      verify: async ({ run, state }) => {
+        const live = await asset(state.asset!.id);
+        check(live.meta?.title === `verify ${run} v2`, `drifted title not repaired: ${live.meta?.title}`);
+        check(live.master_access === "none", `drifted master_access not repaired: ${live.master_access}`);
+        check(JSON.stringify(policies(live)) === '["signed"]', `drifted policies not repaired: ${policies(live)}`);
+        check(track(live, "uploaded", "fr")[0]?.status === "ready", "deleted French track was not restored");
+      },
+    },
+    {
+      name: "unset",
+      plan: { directive: "noop", asset: "update" },
+      verify: async ({ state }) => {
+        const live = await asset(state.asset!.id);
+        check(!live.meta?.title, `removing meta left title ${live.meta?.title}`);
+      },
+    },
+    {
       name: "redirect",
       plan: { directive: "replace", asset: "update" },
       verify: async ({ state, previous }) => {

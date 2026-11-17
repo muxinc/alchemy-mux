@@ -26,11 +26,16 @@ export const liveStream: Scenario = {
         "generated_subtitles",
         "embedded_subtitles",
         "new_asset_settings",
+        "use_slate_for_standard_latency",
+        "reconnect_slate_url",
+        "max_continuous_duration",
       ]),
     vocab: async (a) =>
       same("vocab", a, (await mux("GET", `/video/v1/transcription-vocabularies/${a.id}`)).data, [
         "name",
         "phrases",
+        "name",
+        "passthrough",
       ]),
     target: async (a) => same("target", a, (await mux("GET", targetPath(a))).data, ["url"]),
   },
@@ -86,6 +91,8 @@ export const liveStream: Scenario = {
         const vocab = (await mux("GET", `/video/v1/transcription-vocabularies/${state.vocab!.id}`)).data;
         check(state.vocab!.id === previous.vocab!.id, "vocabulary was replaced instead of updated");
         check(vocab.phrases.includes(run), `phrases are ${JSON.stringify(vocab.phrases)}`);
+        check(vocab.name === `verify ${run} v2`, `vocabulary name is ${vocab.name}`);
+        check(vocab.passthrough === `${run}-v2`, `vocabulary passthrough is ${vocab.passthrough}`);
       },
     },
     {
@@ -105,6 +112,110 @@ export const liveStream: Scenario = {
         check(state.stream!.id === previous.stream!.id, "title change replaced the stream");
         const live = await stream(state.stream!.id);
         check(live.meta?.title === `verify ${run} v3`, `title is ${live.meta?.title}`);
+        check(live.passthrough === `${run}-v3`, `passthrough is ${live.passthrough}`);
+      },
+    },
+    {
+      name: "slate",
+      plan: { vocab: "noop", stream: "update", target: "noop" },
+      verify: async ({ run, state, previous }) => {
+        check(state.stream!.id === previous.stream!.id, "slate settings replaced the stream");
+        check(state.stream!.stream_key === previous.stream!.stream_key, "stream key rotated");
+        const live = await stream(state.stream!.id);
+        check(live.use_slate_for_standard_latency === true, "use_slate_for_standard_latency not applied");
+        check(live.reconnect_slate_url?.endsWith("example-watermark.png"), "reconnect_slate_url not applied");
+        check(live.max_continuous_duration === 3600, `max_continuous_duration is ${live.max_continuous_duration}`);
+        check(
+          live.new_asset_settings?.meta?.title === `recording ${run}`,
+          `recording title is ${live.new_asset_settings?.meta?.title}`,
+        );
+      },
+    },
+    {
+      name: "halfway",
+      plan: {},
+      failsWith: "Low Latency cannot be used",
+      verify: async ({ state }) => {
+        const live = await stream(state.stream!.id);
+        check(
+          live.latency_mode === "low",
+          `expected Mux to keep the half-applied latency_mode "low", got ${live.latency_mode}; the revert phase would prove nothing`,
+        );
+      },
+    },
+    {
+      name: "revert",
+      // Alchemy resumes the failed update, and while a resource is resuming it
+      // hides even stable attributes such as `id` from dependents
+      // (alchemy/src/Plan.ts, the "updating" exposure). The target cannot see
+      // its stream id, so it is recreated with the same settings.
+      plan: { vocab: "noop", stream: "update", target: "replace" },
+      verify: async ({ state, previous }) => {
+        check(state.stream!.id === previous.stream!.id, "revert replaced the stream");
+        check(state.target!.live_stream_id === state.stream!.id, "target is not on the stream");
+        const target = await mux("GET", targetPath(state.target!));
+        check(target.data?.url === "rtmp://example.com/live-a", `target url is ${target.data?.url}`);
+        check((await mux("GET", targetPath(previous.target!))).status === 404, "old target was left behind");
+        const live = await stream(state.stream!.id);
+        check(live.latency_mode === "reduced", `revert left latency_mode ${live.latency_mode}`);
+        check(!live.generated_subtitles?.length, "revert left generated_subtitles on the stream");
+      },
+    },
+    {
+      name: "drift",
+      detectDrift: true,
+      plan: { vocab: "noop", stream: "update", target: "noop" },
+      before: async ({ previous }) => {
+        const id = previous.stream!.id;
+        const patched = await mux("PATCH", `/video/v1/live-streams/${id}`, {
+          meta: { title: "changed outside alchemy" },
+          reconnect_window: 90,
+          new_asset_settings: { meta: { title: "changed outside alchemy" } },
+        });
+        check(patched.status === 200, `out-of-band PATCH returned ${patched.status}`);
+        const disabled = await mux("PUT", `/video/v1/live-streams/${id}/disable`);
+        check(disabled.status === 200, `out-of-band disable returned ${disabled.status}`);
+      },
+      verify: async ({ run, state }) => {
+        const live = await stream(state.stream!.id);
+        check(live.meta?.title === `verify ${run} v3`, `drifted title not repaired: ${live.meta?.title}`);
+        check(live.reconnect_window === 30, `drifted reconnect_window not repaired: ${live.reconnect_window}`);
+        check(live.status === "idle", `drifted disable not repaired: ${live.status}`);
+        check(
+          live.new_asset_settings?.meta?.title === `recording ${run}`,
+          `drifted recording title not repaired: ${live.new_asset_settings?.meta?.title}`,
+        );
+      },
+    },
+    {
+      name: "unset",
+      plan: { vocab: "noop", stream: "update", target: "noop" },
+      verify: async ({ state, previous }) => {
+        check(state.stream!.id === previous.stream!.id, "removing settings replaced the stream");
+        const live = await stream(state.stream!.id);
+        check(!live.use_slate_for_standard_latency, "use_slate_for_standard_latency not reset");
+        check(!live.reconnect_slate_url, `reconnect_slate_url not cleared: ${live.reconnect_slate_url}`);
+        check(live.max_continuous_duration === 43200, `max_continuous_duration is ${live.max_continuous_duration}`);
+        check(live.reconnect_window === 60, `reconnect_window is ${live.reconnect_window}`);
+        check(!live.new_asset_settings?.meta?.title, `recording title not cleared: ${live.new_asset_settings?.meta?.title}`);
+      },
+    },
+    {
+      name: "caption",
+      plan: { vocab: "noop", stream: "update", target: "noop" },
+      verify: async ({ state }) => {
+        const live = await stream(state.stream!.id);
+        check(live.generated_subtitles?.[0]?.language_code === "en", "generated_subtitles not applied");
+      },
+    },
+    {
+      name: "lowlatency",
+      plan: { vocab: "noop", stream: "update", target: "noop" },
+      verify: async ({ state }) => {
+        const live = await stream(state.stream!.id);
+        check(live.latency_mode === "low", `latency_mode is ${live.latency_mode}`);
+        check(!live.generated_subtitles?.length, "generated_subtitles were not removed");
+        check(!live.embedded_subtitles?.length, "embedded_subtitles were not removed");
       },
     },
     {
