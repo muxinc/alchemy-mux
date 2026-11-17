@@ -1,0 +1,30 @@
+{
+  "name": "alchemy-mux",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Mux Video live streams, signing keys and playback restrictions for Alchemy.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "deploy": "alchemy deploy example/alchemy.run.ts",
+    "destroy": "alchemy destroy example/alchemy.run.ts",
+    "generate": "bun scripts/generate.ts",
+    "verify": "bun test/verify.ts"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "^4.1.4",
+    "@effect/platform-node": "^4.1.4",
+    "@mux/ts": "16.2.0",
+    "@types/bun": "^1.4.4",
+    "alchemy": "2.0.0-beta.87",
+    "effect": "^4.1.4",
+    "openapi-typescript": "7",
+    "typescript": "5.9"
+  }
+}
