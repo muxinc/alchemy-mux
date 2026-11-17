@@ -16,6 +16,10 @@ async function runFor(directiveId: string, assetId: string) {
 
 const policies = (a: any) => (a.playback_ids ?? []).map((p: any) => p.policy).sort();
 const idFor = (a: any, policy: string) => a.playback_ids?.find((p: any) => p.policy === policy)?.id;
+const track = (a: any, source: string, language: string) =>
+  (a.tracks ?? []).filter((t: any) => (t.text_source ?? t.type) === source && t.language_code === language);
+const trackSignature = (a: any) =>
+  (a.tracks ?? []).map((t: any) => `${t.type}/${t.text_source ?? ""}/${t.language_code ?? ""}/${t.name ?? ""}`).sort();
 const rendition = (a: any, resolution: string) =>
   a.static_renditions?.files?.find((f: any) => f.id && f.resolution === resolution);
 
@@ -29,8 +33,14 @@ export const asset_: Scenario = {
     broken: (a) => `/video/v1/assets/${a.id}`,
   },
   matchesMux: {
-    asset: async (a) =>
-      same("asset", a, await asset(a.id), [
+    asset: async (a) => {
+      const live = await asset(a.id);
+      const [persisted, actual] = [trackSignature(a), trackSignature(live)];
+      check(
+        JSON.stringify(persisted) === JSON.stringify(actual),
+        `asset tracks differ: state ${persisted.join(", ")} vs Mux ${actual.join(", ")}`,
+      );
+      same("asset", a, live, [
         "status",
         "playback_ids",
         "meta",
@@ -39,7 +49,8 @@ export const asset_: Scenario = {
         "thumbnail_time",
         "video_quality",
         "test",
-      ]),
+      ]);
+    },
     directive: async (a) =>
       same("directive", a, (await mux("GET", `/robots/v1/directives/${a.id}`)).data, ["name", "bindings"]),
   },
@@ -96,6 +107,49 @@ export const asset_: Scenario = {
       },
     },
     {
+      name: "captions",
+      plan: { directive: "noop", asset: "update" },
+      verify: async ({ state, previous }) => {
+        check(state.asset!.id === previous.asset!.id, "adding tracks re-ingested the asset");
+        const live = await asset(state.asset!.id);
+        const [fr] = track(live, "uploaded", "fr");
+        check(fr?.status === "ready" && fr.name === "Français", `French track is ${JSON.stringify(fr)}`);
+        const [es] = track(live, "audio", "es");
+        check(es?.status === "ready" && es.name === "Español", `Spanish audio track is ${JSON.stringify(es)}`);
+        const [en] = track(live, "generated_vod", "en");
+        check(en && en.status !== "errored" && en.status !== "preparing", `generated track is ${JSON.stringify(en)}`);
+      },
+    },
+    {
+      name: "recaption",
+      plan: { directive: "noop", asset: "update" },
+      verify: async ({ state, previous }) => {
+        check(state.asset!.id === previous.asset!.id, "changing tracks re-ingested the asset");
+        const live = await asset(state.asset!.id);
+        const fr = track(live, "uploaded", "fr");
+        const [oldFr] = track(previous.asset, "uploaded", "fr");
+        check(fr.length === 1, `expected one French track, found ${fr.length}`);
+        check(fr[0].id !== oldFr.id && fr[0].status === "ready", "French track was not replaced with the new file");
+        check(track(live, "generated_vod", "en").length === 0, "removed generated subtitles are still on the asset");
+        check(
+          track(live, "audio", "es")[0]?.id === track(previous.asset, "audio", "es")[0]?.id,
+          "unchanged Spanish audio track was replaced",
+        );
+      },
+    },
+    {
+      name: "badtrack",
+      plan: {},
+      failsWith: 'Mux could not add the text track fr "Français"',
+      verify: async ({ state, previous }) => {
+        check(state.asset!.id === previous.asset!.id, "a failed track replaced the asset");
+        const live = await asset(state.asset!.id);
+        const fr = track(live, "uploaded", "fr");
+        check(fr.length === 1, `expected the French track restored once, found ${fr.length}`);
+        check(fr[0].status !== "errored", "the errored replacement was left on the asset");
+      },
+    },
+    {
       name: "redirect",
       plan: { directive: "replace", asset: "update" },
       verify: async ({ state, previous }) => {
@@ -107,12 +161,23 @@ export const asset_: Scenario = {
       },
     },
     {
+      name: "watermark",
+      plan: { directive: "noop", asset: "replace" },
+      verify: async ({ state, previous }) => {
+        check(state.asset!.id !== previous.asset!.id, "adding a watermark did not create a new asset");
+        check((await asset(state.asset!.id)).status === "ready", "watermarked asset is not ready");
+        const old = await mux("GET", `/video/v1/assets/${previous.asset!.id}`);
+        check(old.status === 404, "the unwatermarked asset was not deleted");
+      },
+    },
+    {
       name: "reingest",
       plan: { directive: "noop", asset: "replace" },
       verify: async ({ state, previous }) => {
         check(state.asset!.id !== previous.asset!.id, "video_quality change did not create a new asset");
         const live = await asset(state.asset!.id);
         check(live.status === "ready" && live.video_quality === "plus", "new asset not ready at plus");
+        check(track(live, "uploaded", "fr")[0]?.status === "ready", "new asset is missing its French track");
         const old = await mux("GET", `/video/v1/assets/${previous.asset!.id}`);
         check(old.status === 404, "replaced asset was not deleted");
       },

@@ -10,6 +10,9 @@ import type { Providers } from "./Providers.ts";
 
 type Schemas = components["schemas"];
 type MuxAsset = Schemas["Asset"];
+type Input = Schemas["InputSettings"];
+type Track = Schemas["Track"];
+type GeneratedSubtitles = Schemas["AssetGeneratedSubtitleSettings"];
 
 /**
  * Field names match the Mux API. Deprecated fields (`input`,
@@ -39,15 +42,26 @@ export type Asset = Resource<"Mux.Asset", AssetProps, AssetAttributes, never, Pr
  *
  * These update in place: `passthrough`, `meta`, `thumbnail_time`,
  * `master_access`, `static_renditions` (renditions are added and removed),
- * `playback_policies` (playback IDs are added and removed), and
- * `directives` (newly listed Directives run on the existing asset). Any
- * other change creates a new asset, which means ingesting and encoding the
- * video again.
+ * `playback_policies` (playback IDs are added and removed), `directives`
+ * (newly listed Directives run on the existing asset), and text and audio
+ * tracks: every `text` and `audio` input, plus the first input's
+ * `generated_subtitles`. Any other change, including the video input or a
+ * watermark (overlay) input, creates a new asset, which means ingesting and
+ * encoding the video again.
  *
- * **Example:** A hero video with an MP4 download and AI captions
+ * A removed track is found by its type, language and name, because Mux does
+ * not report a track's source URL. Give tracks that share a type and
+ * language distinct names; Mux also requires names to be unique per asset.
+ * A changed track is removed before its replacement is added. If a new track
+ * errors, the deploy fails and the asset's tracks are put back as they were.
+ *
+ * **Example:** A hero video with AI captions, French subtitles and an MP4 download
  * ```typescript
  * const hero = yield* Mux.Asset("hero", {
- *   inputs: [{ url: "https://example.com/hero.mp4" }],
+ *   inputs: [
+ *     { url: "https://example.com/hero.mp4", generated_subtitles: [{ language_code: "en" }] },
+ *     { url: "https://example.com/hero-fr.vtt", type: "text", text_type: "subtitles", language_code: "fr", name: "Français" },
+ *   ],
  *   playback_policies: ["public"],
  *   video_quality: "plus",
  *   static_renditions: [{ resolution: "highest" }],
@@ -71,6 +85,26 @@ export class AssetIngestFailed extends Data.TaggedError("AssetIngestFailed")<{
   }
 }
 
+/** A track added to an existing asset errored. The tracks added in that deploy were removed. */
+export class AssetTrackFailed extends Data.TaggedError("AssetTrackFailed")<{
+  readonly id: string;
+  readonly track: string;
+}> {
+  override get message() {
+    return `Mux could not add the ${this.track} to asset ${this.id}. The tracks added in this deploy were removed.`;
+  }
+}
+
+/** Several tracks match a removed input, so the provider cannot tell which to delete. */
+export class AssetTrackAmbiguous extends Data.TaggedError("AssetTrackAmbiguous")<{
+  readonly id: string;
+  readonly track: string;
+}> {
+  override get message() {
+    return `Asset ${this.id} has several tracks matching the removed ${this.track}. Give tracks that share a type and language distinct names.`;
+  }
+}
+
 /** Raised if the engine asks to update a field Mux only sets at creation. */
 export class AssetImmutableChange extends Data.TaggedError("AssetImmutableChange")<{
   readonly id: string;
@@ -89,6 +123,7 @@ const APPLY = {
   static_renditions: "static-renditions",
   playback_policies: "playback-ids",
   directives: "directives",
+  inputs: "tracks",
   wait_for_ready: "nothing",
 } as const satisfies Partial<Record<keyof AssetProps, string>>;
 
@@ -99,12 +134,58 @@ const plan = (olds: AssetProps, news: AssetProps): Set<Applied> | "replace" => {
   const keys = new Set([...Object.keys(olds), ...Object.keys(news)]) as Set<keyof AssetProps>;
   for (const key of keys) {
     if (isResolved(news[key]) && deepEqual(olds[key], news[key])) continue;
+    if (key === "inputs" && !sameSource(olds.inputs, news.inputs)) return "replace";
     const how = APPLY[key as keyof typeof APPLY];
     if (how === undefined) return "replace";
     needed.add(how);
   }
   return needed;
 };
+
+const isTrack = (input: Input) => input.type === "text" || input.type === "audio";
+
+/**
+ * The video and any watermark (overlay) inputs are the source, which only a
+ * new asset can change. Text and audio inputs, and the video's generated
+ * subtitles, are tracks.
+ */
+const splitInputs = (inputs: Input[] | undefined) => {
+  const [first, ...rest] = inputs ?? [];
+  const { generated_subtitles, ...video } = first ?? {};
+  return {
+    source: [video, ...rest.filter((i) => !isTrack(i))],
+    subtitles: generated_subtitles ?? [],
+    tracks: rest.filter(isTrack),
+  };
+};
+
+const sameSource = (olds: Input[] | undefined, news: Input[] | undefined) =>
+  isResolved(news) && deepEqual(splitInputs(olds).source, splitInputs(news).source);
+
+/** Items of `items` left after removing one deep-equal match per item of `remove`. */
+const without = <T>(items: T[], remove: T[]) => {
+  const rest = [...remove];
+  return items.filter((item) => {
+    const i = rest.findIndex((r) => deepEqual(r, item));
+    if (i >= 0) rest.splice(i, 1);
+    return i < 0;
+  });
+};
+
+const describe = (t: { type?: string; language_code?: string; name?: string }) =>
+  `${t.type ?? "text"} track ${t.language_code ?? ""}${t.name ? ` "${t.name}"` : ""}`.trim();
+
+const matchesInput = (input: Input) => (t: Track) =>
+  (t.type === "text" ? t.text_source === "uploaded" : t.type === "audio" && t.primary !== true) &&
+  t.type === input.type &&
+  t.language_code === input.language_code &&
+  (t.type !== "text" || (t.text_type ?? "subtitles") === (input.text_type ?? "subtitles")) &&
+  (input.name === undefined || t.name === input.name);
+
+const matchesGenerated = (settings: GeneratedSubtitles) => (t: Track) =>
+  t.text_source === "generated_vod" &&
+  (settings.language_code === undefined || settings.language_code === "auto" || t.language_code === settings.language_code) &&
+  (settings.name === undefined || t.name === settings.name);
 
 const POLL_INTERVAL = Duration.seconds(2);
 const READY_TIMEOUT = Duration.minutes(30);
@@ -128,7 +209,13 @@ export const AssetProvider = () =>
         Effect.gen(function* () {
           for (;;) {
             const asset = yield* get(id);
-            if (asset.status === "ready") return asset;
+            const settled = !asset.tracks?.some((t) => t.status === "preparing");
+            if (asset.status === "ready" && settled) {
+              const failed = asset.tracks?.find((t) => t.status === "errored");
+              if (!failed) return asset;
+              yield* mux.request("DELETE", path(id)).pipe(Effect.ignore);
+              return yield* new AssetIngestFailed({ id, reason: `the ${describe(failed)} errored` });
+            }
             if (asset.status === "errored") {
               yield* mux.request("DELETE", path(id)).pipe(Effect.ignore);
               const reason = asset.errors?.messages?.join("; ") ?? asset.errors?.type ?? "unknown error";
@@ -137,6 +224,84 @@ export const AssetProvider = () =>
             yield* Effect.sleep(POLL_INTERVAL);
           }
         }).pipe(Effect.timeout(READY_TIMEOUT));
+
+      const applyTracks = (asset: MuxAsset, olds: AssetProps | undefined, news: AssetProps) =>
+        Effect.gen(function* () {
+          const before = splitInputs(olds?.inputs);
+          const after = splitInputs(news.inputs);
+          const existing = (asset.tracks ?? []).filter((t) => t.id);
+          const claimed = new Set<string>();
+          const unclaimed = (matches: (t: Track) => boolean) =>
+            existing.filter((t) => !claimed.has(t.id!) && matches(t));
+
+          const audio = existing.find((t) => t.type === "audio" && t.primary) ?? existing.find((t) => t.type === "audio");
+          const addTrack = (input: Input) => mux.request<Track>("POST", `${path(asset.id)}/tracks`, input);
+          const generate = (subtitles: GeneratedSubtitles[]) =>
+            audio
+              ? mux.request<Track[]>("POST", `${path(asset.id)}/tracks/${audio.id}/generate-subtitles`, {
+                  generated_subtitles: subtitles,
+                })
+              : Effect.fail(new AssetTrackFailed({ id: asset.id, track: "generated subtitles (the asset has no audio)" }));
+
+          // Each removed track carries the request that recreates it, for rollback.
+          const doomed: { id: string; restore: Effect.Effect<unknown, unknown> }[] = [];
+          const removals = [
+            ...without(before.tracks, after.tracks).map((i) => [describe(i), matchesInput(i), addTrack(i)] as const),
+            ...without(before.subtitles, after.subtitles).map(
+              (s) => [describe({ ...s, name: s.name ?? "generated" }), matchesGenerated(s), generate([s])] as const,
+            ),
+          ];
+          for (const [label, matches, restore] of removals) {
+            const found = unclaimed(matches);
+            if (found.length > 1) return yield* new AssetTrackAmbiguous({ id: asset.id, track: label });
+            for (const t of found) {
+              claimed.add(t.id!);
+              doomed.push({ id: t.id!, restore });
+            }
+          }
+
+          // An adopted asset may already have a declared track; keep it.
+          const isNew = (matches: (t: Track) => boolean) => {
+            const present = olds === undefined ? unclaimed(matches)[0] : undefined;
+            if (present) claimed.add(present.id!);
+            return present === undefined;
+          };
+          const addedInputs = without(after.tracks, before.tracks).filter((i) => isNew(matchesInput(i)));
+          const addedSubtitles = without(after.subtitles, before.subtitles).filter((s) => isNew(matchesGenerated(s)));
+
+          const removed: Effect.Effect<unknown, unknown>[] = [];
+          const added: Track[] = [];
+          yield* Effect.gen(function* () {
+            // Mux requires unique track names, so a replaced track goes before its successor.
+            for (const { id, restore } of doomed) {
+              yield* mux
+                .request("DELETE", `${path(asset.id)}/tracks/${id}`)
+                .pipe(Effect.catchTag("NotFound", () => Effect.void));
+              removed.push(restore);
+            }
+            for (const input of addedInputs) added.push(yield* addTrack(input));
+            if (addedSubtitles.length > 0) added.push(...(yield* generate(addedSubtitles)));
+            if (news.wait_for_ready === false || added.length === 0) return;
+            for (;;) {
+              const current = (yield* get(asset.id)).tracks ?? [];
+              const mine = current.filter((t) => added.some((a) => a.id === t.id));
+              const failed = mine.find((t) => t.status === "errored");
+              if (failed) return yield* new AssetTrackFailed({ id: asset.id, track: describe(failed) });
+              if (!mine.some((t) => t.status === "preparing")) return;
+              yield* Effect.sleep(POLL_INTERVAL);
+            }
+          }).pipe(
+            Effect.timeout(READY_TIMEOUT),
+            Effect.onError(() =>
+              Effect.gen(function* () {
+                for (const t of added) {
+                  yield* mux.request("DELETE", `${path(asset.id)}/tracks/${t.id}`).pipe(Effect.ignore);
+                }
+                for (const restore of removed) yield* restore.pipe(Effect.ignore);
+              }),
+            ),
+          );
+        });
 
       const apply = (asset: MuxAsset, how: Applied, olds: AssetProps | undefined, news: AssetProps) =>
         Effect.gen(function* () {
@@ -201,6 +366,8 @@ export const AssetProvider = () =>
               }
               return;
             }
+            case "tracks":
+              return yield* applyTracks(asset, olds, news);
           }
         });
 
