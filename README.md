@@ -18,7 +18,7 @@ between betas.
 
 | Resource | Updates in place | Changing it creates a new one |
 | --- | --- | --- |
-| `Mux.Asset` | `passthrough`, `meta`, `thumbnail_time`, `master_access`, `static_renditions`, `playback_policies` (adds and removes playback IDs), `directives` (new ones run on the existing asset) | `inputs`, `video_quality`, `test` and other ingest settings (re-encodes) |
+| `Mux.Asset` | `passthrough`, `meta`, `thumbnail_time`, `master_access`, `static_renditions`, `playback_policies` (adds and removes playback IDs), `directives` (new ones run on the existing asset), text and audio tracks (every input after the first, and the first input's `generated_subtitles`) | the first input's URL, clip or overlay, `video_quality`, `test` and other ingest settings (re-encodes) |
 | `Mux.LiveStream` | latency, reconnect window and slate, max duration, passthrough, title, `enabled`, live and embedded captions, `mp4_support` / `master_access` / `video_quality` of recordings | playback policies, `audio_only`, `test`, other recording settings (new stream key) |
 | `Mux.SimulcastTarget` | nothing | everything (Mux has no update endpoint) |
 | `Mux.TranscriptionVocabulary` | name, phrases, passthrough | nothing |
@@ -32,7 +32,9 @@ between betas.
 and `drm_playback_id`, because Alchemy Outputs cannot be indexed.
 
 By default, `Asset` waits during deploy until Mux has ingested the video.
-If ingest fails, it deletes the errored asset and fails the deploy. Set
+If ingest fails, or a track errors, it deletes the errored asset and fails
+the deploy. Tracks added to an existing asset are waited on too; if one
+errors, the tracks added in that deploy are removed. Set
 `wait_for_ready: false` to skip the wait.
 
 Secrets Mux returns only once (`stream_key`, `srt_passphrase`, `private_key`,
@@ -118,5 +120,9 @@ same.
 - Playback IDs come back in no stable order, so the provider sorts them.
 - Annotations dated far in the past (for example, 2023) get a 500 instead of
   a 400.
+- Track names must be unique per asset, so a changed track is removed before
+  its replacement is added. Mux does not report a track's source URL, so the
+  provider finds tracks by type, language and name.
+- A track with a bad URL errors while the asset stays `ready`.
 - Live streams reject `video_quality: "basic"`, test streams reject simulcast
   targets, and low latency cannot be combined with live captions.
