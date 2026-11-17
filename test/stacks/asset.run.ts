@@ -4,13 +4,14 @@ import * as Mux from "../../src/index.ts";
 
 const run = process.env.MUX_TEST_RUN!;
 const phase = process.env.MUX_TEST_PHASE!;
-const phases = ["create", "update", "trim", "captions", "recaption", "badtrack", "redirect", "reingest", "badinput"];
+const phases = ["create", "update", "trim", "captions", "recaption", "badtrack", "redirect", "watermark", "reingest", "badinput"];
 const at = (name: string) => phases.indexOf(phase) >= phases.indexOf(name);
 const between = (from: string, to: string) => at(from) && !at(to);
 
 export const DEMO_URL = "https://storage.googleapis.com/muxdemofiles/mux.mp4";
 const FR_VTT = "https://tears-of-steel-subtitles.s3.amazonaws.com/tears-fr.vtt";
 const EN_VTT = "https://tears-of-steel-subtitles.s3.amazonaws.com/tears-en.vtt";
+const WATERMARK = "https://muxed.s3.amazonaws.com/example-watermark.png";
 
 export default Alchemy.Stack(
   "MuxVerifyAsset",
@@ -32,7 +33,7 @@ export default Alchemy.Stack(
         ...(at("captions")
           ? [
               {
-                url: at("recaption") ? EN_VTT : FR_VTT,
+                url: phase === "badtrack" ? `https://example.com/alchemy-mux/${run}/missing.vtt` : at("recaption") ? EN_VTT : FR_VTT,
                 type: "text" as const,
                 text_type: "subtitles" as const,
                 language_code: "fr",
@@ -41,16 +42,8 @@ export default Alchemy.Stack(
               { url: DEMO_URL, type: "audio" as const, language_code: "es", name: "Español" },
             ]
           : []),
-        ...(phase === "badtrack"
-          ? [
-              {
-                url: `https://example.com/alchemy-mux/${run}/missing.vtt`,
-                type: "text" as const,
-                text_type: "subtitles" as const,
-                language_code: "de",
-                name: "Broken",
-              },
-            ]
+        ...(at("watermark")
+          ? [{ url: WATERMARK, overlay_settings: { horizontal_align: "right" as const, width: "10%" } }]
           : []),
       ],
       test: true,
