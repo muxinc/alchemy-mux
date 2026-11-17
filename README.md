@@ -4,6 +4,16 @@ Mux resources and runtime bindings for [Alchemy](https://alchemy.run) v2.
 See `example/alchemy.run.ts` for a stack that uses all of them. That stack
 is deployed and destroyed by `bun run verify`.
 
+The package is not on npm yet. Once it is published:
+
+```sh
+npm install @mux/alchemy alchemy@2.0.0-beta.87 effect
+```
+
+The package ships compiled JavaScript for Node and the TypeScript source for
+Bun. It is pinned to one Alchemy beta, because Alchemy's API can change
+between betas.
+
 ## Resources
 
 | Resource | Updates in place | Changing it creates a new one |
@@ -60,7 +70,8 @@ counts as done. It runs these checks in order and stops at the first failure:
    write, and belongs to a non-production environment.
 2. **Generated types.** `src/generated/mux-api.ts` matches what
    `bun run generate` produces from the vendored `spec/mux-api-spec.json`.
-3. **Typecheck,** including the tests and the example.
+3. **Typecheck,** including the tests and the example. Then the package
+   builds, and Node loads it through its `exports` map.
 4. **API client.** Against a local fake server: 429s retry and honor
    `Retry-After`, POSTs never retry after a 5xx, retries stop at the cap, 404
    maps to `NotFound`, lists page, and auth is sent.
@@ -84,6 +95,10 @@ counts as done. It runs these checks in order and stops at the first failure:
    gone, or still present if it was retained.
 6. **Sweep.** Every Mux object type is listed, and nothing tagged with this
    run's ID may remain.
+
+CI runs every gate on each pull request and each push to `main`, one run at
+a time, with the `MUX_TOKEN_ID` and `MUX_TOKEN_SECRET` repository secrets.
+Those must belong to a development environment.
 
 Run chosen scenarios with `bun run verify asset bindings`. A full run takes
 several minutes, creates only test assets and idle streams, and deletes
