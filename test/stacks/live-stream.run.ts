@@ -6,7 +6,7 @@ import * as Mux from "../../src/index.ts";
 const run = process.env.MUX_TEST_RUN!;
 const phase = process.env.MUX_TEST_PHASE!;
 const phases = [
-  "create", "update", "reenable", "retitle", "slate", "halfway", "revert", "drift", "unset", "caption", "lowlatency",
+  "create", "update", "reenable", "retitle", "slate", "halfway", "revert", "drift", "unset", "caption", "plaincaption", "lowlatency",
   "retarget", "replace",
 ];
 const at = (name: string) => phases.indexOf(phase) >= phases.indexOf(name);
@@ -47,9 +47,10 @@ export default Alchemy.Stack(
       ...(phase === "update" && { enabled: false }),
       ...(["update", "halfway", "caption"].includes(phase) && {
         generated_subtitles: [
-          { language_code: "en" as const, transcription_vocabulary_ids: [vocab.id] },
+          { language_code: "en" as const, transcription_vocabulary_ids: [vocab.id], passthrough: run },
         ],
       }),
+      ...(phase === "plaincaption" && { generated_subtitles: [{ language_code: "en" as const }] }),
     });
 
     const target = yield* Mux.SimulcastTarget("target", {

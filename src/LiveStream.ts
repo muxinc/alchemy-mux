@@ -113,15 +113,42 @@ const replaces = (olds: LiveStreamProps, news: LiveStreamProps) =>
         !deepEqual(omit(olds.new_asset_settings, NEW_ASSET_UPDATABLE), omit(news.new_asset_settings, NEW_ASSET_UPDATABLE))),
   );
 
-/** What Mux holds for a PATCH field the props leave out; Mux omits these values from responses. */
-const PATCH_DEFAULTS = {
-  passthrough: "",
-  latency_mode: "standard",
-  reconnect_window: 60,
-  use_slate_for_standard_latency: false,
-  reconnect_slate_url: "",
-  max_continuous_duration: 43200,
-} as const;
+const PATCHED = [
+  "passthrough",
+  "latency_mode",
+  "reconnect_window",
+  "use_slate_for_standard_latency",
+  "reconnect_slate_url",
+  "max_continuous_duration",
+] as const;
+
+/** What a new stream with these props would hold for a PATCH field the props leave out. */
+const createDefault = (news: LiveStreamProps, key: (typeof PATCHED)[number]) =>
+  ({
+    passthrough: "",
+    latency_mode: "standard",
+    // 60 for standard latency, 0 for reduced and low.
+    reconnect_window: (news.latency_mode ?? "standard") === "standard" ? 60 : 0,
+    use_slate_for_standard_latency: false,
+    reconnect_slate_url: "",
+    // Test streams are fixed at 300 seconds.
+    max_continuous_duration: news.test ? undefined : 43200,
+  })[key];
+
+/** Mux omits these fields from responses when they are empty, false or 0. */
+const OMITTED_WHEN_EMPTY = { passthrough: "", use_slate_for_standard_latency: false, reconnect_slate_url: "", reconnect_window: 0 };
+
+/** Fields Mux omits when empty are filled in on both sides, so clearing them is visible. */
+const caption = <T extends { passthrough?: string; transcription_vocabulary_ids?: string[] }>(c: T, generated: boolean) => ({
+  ...c,
+  passthrough: c.passthrough ?? "",
+  ...(generated && { transcription_vocabulary_ids: c.transcription_vocabulary_ids ?? [] }),
+});
+const captionsMatch = (want: object[], have: object[] | undefined, generated: boolean) =>
+  matches(
+    want.map((c) => caption(c, generated)),
+    (have ?? []).map((c) => caption(c, generated)),
+  );
 
 type Pending = {
   patch: Record<string, unknown>;
@@ -135,11 +162,10 @@ type Observed = Omit<Partial<MuxLiveStream>, "stream_key" | "srt_passphrase">;
 
 const pending = (news: LiveStreamProps, live: Observed): Pending => {
   const patch: Record<string, unknown> = {};
-  for (const [key, fallback] of Object.entries(PATCH_DEFAULTS) as [keyof typeof PATCH_DEFAULTS, unknown][]) {
-    // Test streams are fixed at a 300 second limit.
-    const base = key === "max_continuous_duration" && news.test ? undefined : fallback;
-    const want = news[key] ?? base;
-    if (want !== undefined && !deepEqual(want, live[key] ?? base)) patch[key] = want;
+  for (const key of PATCHED) {
+    const want = news[key] ?? createDefault(news, key);
+    const have = live[key] ?? OMITTED_WHEN_EMPTY[key as keyof typeof OMITTED_WHEN_EMPTY];
+    if (want !== undefined && want !== have) patch[key] = want;
   }
   const meta = metaWrite(news.meta, live.meta);
   if (meta) patch.meta = meta;
@@ -162,8 +188,8 @@ const pending = (news: LiveStreamProps, live: Observed): Pending => {
   const embedded = news.embedded_subtitles ?? [];
   return {
     patch,
-    ...(!matches(generated, live.generated_subtitles ?? []) && { generated_subtitles: generated }),
-    ...(!matches(embedded, live.embedded_subtitles ?? []) && { embedded_subtitles: embedded }),
+    ...(!captionsMatch(generated, live.generated_subtitles, true) && { generated_subtitles: generated }),
+    ...(!captionsMatch(embedded, live.embedded_subtitles, false) && { embedded_subtitles: embedded }),
     ...((news.enabled === false) !== (live.status === "disabled") && { enabled: news.enabled !== false }),
   };
 };

@@ -196,7 +196,8 @@ export const liveStream: Scenario = {
         check(!live.use_slate_for_standard_latency, "use_slate_for_standard_latency not reset");
         check(!live.reconnect_slate_url, `reconnect_slate_url not cleared: ${live.reconnect_slate_url}`);
         check(live.max_continuous_duration === 43200, `max_continuous_duration is ${live.max_continuous_duration}`);
-        check(live.reconnect_window === 60, `reconnect_window is ${live.reconnect_window}`);
+        // Absent means 0, Mux's default for a reduced latency stream.
+        check(live.reconnect_window === undefined, `reconnect_window is ${live.reconnect_window}, not the reduced default 0`);
         check(!live.new_asset_settings?.meta?.title, `recording title not cleared: ${live.new_asset_settings?.meta?.title}`);
       },
     },
@@ -205,7 +206,18 @@ export const liveStream: Scenario = {
       plan: { vocab: "noop", stream: "update", target: "noop" },
       verify: async ({ state }) => {
         const live = await stream(state.stream!.id);
-        check(live.generated_subtitles?.[0]?.language_code === "en", "generated_subtitles not applied");
+        const [en] = live.generated_subtitles ?? [];
+        check(en?.transcription_vocabulary_ids?.length === 1, "generated_subtitles missing the vocabulary");
+      },
+    },
+    {
+      name: "plaincaption",
+      plan: { vocab: "noop", stream: "update", target: "noop" },
+      verify: async ({ state }) => {
+        const [en] = (await stream(state.stream!.id)).generated_subtitles ?? [];
+        check(en?.language_code === "en", "generated_subtitles were removed instead of changed");
+        check(!en.transcription_vocabulary_ids?.length, `vocabulary ids not cleared: ${en.transcription_vocabulary_ids}`);
+        check(!en.passthrough, `caption passthrough not cleared: ${en.passthrough}`);
       },
     },
     {
@@ -216,6 +228,7 @@ export const liveStream: Scenario = {
         check(live.latency_mode === "low", `latency_mode is ${live.latency_mode}`);
         check(!live.generated_subtitles?.length, "generated_subtitles were not removed");
         check(!live.embedded_subtitles?.length, "embedded_subtitles were not removed");
+        check(live.reconnect_window === undefined, `an unrelated update wrote reconnect_window ${live.reconnect_window}`);
       },
     },
     {
