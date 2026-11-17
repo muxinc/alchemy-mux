@@ -144,6 +144,9 @@ same.
 - Playback IDs come back in no stable order, so the provider sorts them.
 - Live stream `meta` and recording `meta` ignore `{}`. A key is cleared by
   sending it as an empty string. Live stream `meta` keeps only `title`.
+- Live stream `reconnect_window` is omitted when it is 0. It defaults to 60
+  for standard latency and 0 for reduced and low, and changing latency
+  does not change it.
 - Test live streams are fixed at `max_continuous_duration: 300`; other
   streams default to 43200.
 - Annotations dated far in the past (for example, 2023) get a 500 instead of
