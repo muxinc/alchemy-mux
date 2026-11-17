@@ -4,6 +4,7 @@ import { Resource } from "alchemy/Resource";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
+import { matches, metaWrite } from "./Converge.ts";
 import { listAll, Mux, playbackIdsByPolicy, type PlaybackIdsByPolicy, sortPlaybackIds } from "./Api.ts";
 import type { components } from "./generated/mux-api.ts";
 import type { Providers } from "./Providers.ts";
@@ -53,11 +54,17 @@ export type LiveStream = Resource<
  *
  * Most settings update in place. `playback_policies`,
  * `advanced_playback_policies`, `audio_only`, `test`, and any
- * `new_asset_settings` field other than `mp4_support`, `master_access` and
- * `video_quality` are fixed at creation: changing them creates a new stream
- * with a new stream key.
+ * `new_asset_settings` field other than `mp4_support`, `master_access`,
+ * `video_quality` and `meta` are fixed at creation: changing them creates a
+ * new stream with a new stream key.
  *
- * Mux does not allow `latency_mode: "low"` together with `generated_subtitles`.
+ * Updates compare the props with the stream as Mux reports it, so a deploy
+ * after a failed one finishes or reverts the half-applied change, and
+ * `alchemy deploy --detect-drift` repairs settings changed outside Alchemy. A setting removed from the props returns to Mux's default.
+ *
+ * Mux does not allow `latency_mode: "low"` together with `generated_subtitles`
+ * or `embedded_subtitles`. When both change, captions are removed before the
+ * latency changes.
  *
  * **Example:** Reduced-latency stream with live English captions
  * ```typescript
@@ -73,53 +80,118 @@ export type LiveStream = Resource<
  */
 export const LiveStream = Resource<LiveStream>("Mux.LiveStream");
 
-/** How a change to each field reaches Mux. Fields not listed force a replacement. */
-const APPLY = {
-  passthrough: "patch",
-  latency_mode: "patch",
-  reconnect_window: "patch",
-  use_slate_for_standard_latency: "patch",
-  reconnect_slate_url: "patch",
-  max_continuous_duration: "patch",
-  meta: "patch",
-  new_asset_settings: "patch",
-  generated_subtitles: "generated-subtitles",
-  embedded_subtitles: "embedded-subtitles",
-  enabled: "enabled",
-} as const satisfies Partial<Record<keyof LiveStreamProps, string>>;
+/** Props Mux can change on an existing stream. Changing any other prop creates a new stream. */
+export const LiveStreamUpdatable: ReadonlySet<string> = new Set([
+  "passthrough",
+  "latency_mode",
+  "reconnect_window",
+  "use_slate_for_standard_latency",
+  "reconnect_slate_url",
+  "max_continuous_duration",
+  "meta",
+  "new_asset_settings",
+  "generated_subtitles",
+  "embedded_subtitles",
+  "enabled",
+] satisfies (keyof LiveStreamProps)[]);
 
-type Applied = (typeof APPLY)[keyof typeof APPLY];
-
-const PATCHED = Object.keys(APPLY).filter((key) => APPLY[key as keyof typeof APPLY] === "patch");
-
-const NEW_ASSET_UPDATABLE = ["mp4_support", "master_access", "video_quality"] as const;
-
-const pick = (value: Record<string, unknown> | undefined, keys: readonly string[]) =>
-  Object.fromEntries(keys.filter((key) => value?.[key] !== undefined).map((key) => [key, value![key]]));
+const NEW_ASSET_UPDATABLE = ["mp4_support", "master_access", "video_quality", "meta"];
 
 const omit = (value: Record<string, unknown> | undefined, keys: readonly string[]) =>
   Object.fromEntries(Object.entries(value ?? {}).filter(([key]) => !keys.includes(key)));
 
-/** Which application paths a change needs, or `"replace"`. */
-const plan = (olds: LiveStreamProps, news: LiveStreamProps): Set<Applied> | "replace" => {
-  const needed = new Set<Applied>();
-  const keys = new Set([...Object.keys(olds), ...Object.keys(news)]) as Set<keyof LiveStreamProps>;
-  for (const key of keys) {
-    if (isResolved(news[key]) && deepEqual(olds[key], news[key])) continue;
-    const how = APPLY[key as keyof typeof APPLY];
-    if (how === undefined) return "replace";
-    if (
-      key === "new_asset_settings" &&
-      !deepEqual(
-        omit(olds.new_asset_settings, NEW_ASSET_UPDATABLE),
-        omit(news.new_asset_settings, NEW_ASSET_UPDATABLE),
-      )
-    ) {
-      return "replace";
-    }
-    needed.add(how);
+const propsChanged = (olds: LiveStreamProps, news: LiveStreamProps) =>
+  [...new Set([...Object.keys(olds), ...Object.keys(news)])].filter(
+    (key) => !isResolved(news[key as keyof LiveStreamProps]) || !deepEqual(olds[key as keyof LiveStreamProps], news[key as keyof LiveStreamProps]),
+  );
+
+const replaces = (olds: LiveStreamProps, news: LiveStreamProps) =>
+  propsChanged(olds, news).some(
+    (key) =>
+      !LiveStreamUpdatable.has(key) ||
+      (key === "new_asset_settings" &&
+        !deepEqual(omit(olds.new_asset_settings, NEW_ASSET_UPDATABLE), omit(news.new_asset_settings, NEW_ASSET_UPDATABLE))),
+  );
+
+const PATCHED = [
+  "passthrough",
+  "latency_mode",
+  "reconnect_window",
+  "use_slate_for_standard_latency",
+  "reconnect_slate_url",
+  "max_continuous_duration",
+] as const;
+
+/** What a new stream with these props would hold for a PATCH field the props leave out. */
+const createDefault = (news: LiveStreamProps, key: (typeof PATCHED)[number]) =>
+  ({
+    passthrough: "",
+    latency_mode: "standard",
+    // 60 for standard latency, 0 for reduced and low.
+    reconnect_window: (news.latency_mode ?? "standard") === "standard" ? 60 : 0,
+    use_slate_for_standard_latency: false,
+    reconnect_slate_url: "",
+    // Test streams are fixed at 300 seconds.
+    max_continuous_duration: news.test ? undefined : 43200,
+  })[key];
+
+/** Mux omits these fields from responses when they are empty, false or 0. */
+const OMITTED_WHEN_EMPTY = { passthrough: "", use_slate_for_standard_latency: false, reconnect_slate_url: "", reconnect_window: 0 };
+
+/** Fields Mux omits when empty are filled in on both sides, so clearing them is visible. */
+const caption = <T extends { passthrough?: string; transcription_vocabulary_ids?: string[] }>(c: T, generated: boolean) => ({
+  ...c,
+  passthrough: c.passthrough ?? "",
+  ...(generated && { transcription_vocabulary_ids: c.transcription_vocabulary_ids ?? [] }),
+});
+const captionsMatch = (want: object[], have: object[] | undefined, generated: boolean) =>
+  matches(
+    want.map((c) => caption(c, generated)),
+    (have ?? []).map((c) => caption(c, generated)),
+  );
+
+type Pending = {
+  patch: Record<string, unknown>;
+  generated_subtitles?: LiveStreamProps["generated_subtitles"];
+  embedded_subtitles?: LiveStreamProps["embedded_subtitles"];
+  enabled?: boolean;
+};
+
+/** The writes that bring `live` to the state `news` describes, compared field by field. */
+type Observed = Omit<Partial<MuxLiveStream>, "stream_key" | "srt_passphrase">;
+
+const pending = (news: LiveStreamProps, live: Observed): Pending => {
+  const patch: Record<string, unknown> = {};
+  for (const key of PATCHED) {
+    const want = news[key] ?? createDefault(news, key);
+    const have = live[key] ?? OMITTED_WHEN_EMPTY[key as keyof typeof OMITTED_WHEN_EMPTY];
+    if (want !== undefined && want !== have) patch[key] = want;
   }
-  return needed;
+  const meta = metaWrite(news.meta, live.meta);
+  if (meta) patch.meta = meta;
+
+  const wantAsset = news.new_asset_settings ?? {};
+  const haveAsset = live.new_asset_settings ?? {};
+  const asset: Record<string, unknown> = {};
+  for (const key of ["mp4_support", "master_access"] as const) {
+    const want = wantAsset[key] ?? "none";
+    if (want !== (haveAsset[key] ?? "none")) asset[key] = want;
+  }
+  if (wantAsset.video_quality !== undefined && wantAsset.video_quality !== haveAsset.video_quality) {
+    asset.video_quality = wantAsset.video_quality;
+  }
+  const assetMeta = metaWrite(wantAsset.meta, haveAsset.meta);
+  if (assetMeta) asset.meta = assetMeta;
+  if (Object.keys(asset).length > 0) patch.new_asset_settings = asset;
+
+  const generated = news.generated_subtitles ?? [];
+  const embedded = news.embedded_subtitles ?? [];
+  return {
+    patch,
+    ...(!captionsMatch(generated, live.generated_subtitles, true) && { generated_subtitles: generated }),
+    ...(!captionsMatch(embedded, live.embedded_subtitles, false) && { embedded_subtitles: embedded }),
+    ...((news.enabled === false) !== (live.status === "disabled") && { enabled: news.enabled !== false }),
+  };
 };
 
 /** Raised if the engine asks to update a field Mux only sets at creation. */
@@ -152,27 +224,24 @@ export const LiveStreamProvider = () =>
       const path = (id: string) => `/video/v1/live-streams/${id}`;
       const get = (id: string) => mux.request<MuxLiveStream>("GET", path(id));
 
-      const apply = (id: string, how: Applied, news: LiveStreamProps) => {
-        switch (how) {
-          case "patch": {
-            const body = pick(news, PATCHED);
-            const assetSettings = pick(news.new_asset_settings, NEW_ASSET_UPDATABLE);
-            if (Object.keys(assetSettings).length > 0) body.new_asset_settings = assetSettings;
-            else delete body.new_asset_settings;
-            return mux.request("PATCH", path(id), body);
+      const write = (id: string, p: Pending) =>
+        Effect.gen(function* () {
+          const subtitles = (key: "generated_subtitles" | "embedded_subtitles") =>
+            p[key] === undefined
+              ? Effect.void
+              : mux.request("PUT", `${path(id)}/${key.replace("_", "-")}`, { [key]: p[key] });
+          // Mux rejects low latency while captions are on, so captions are
+          // removed before the PATCH and added after it.
+          const removing = (key: "generated_subtitles" | "embedded_subtitles") => p[key]?.length === 0;
+          if (removing("generated_subtitles")) yield* subtitles("generated_subtitles");
+          if (removing("embedded_subtitles")) yield* subtitles("embedded_subtitles");
+          if (Object.keys(p.patch).length > 0) yield* mux.request("PATCH", path(id), p.patch);
+          if (!removing("generated_subtitles")) yield* subtitles("generated_subtitles");
+          if (!removing("embedded_subtitles")) yield* subtitles("embedded_subtitles");
+          if (p.enabled !== undefined) {
+            yield* mux.request("PUT", `${path(id)}/${p.enabled ? "enable" : "disable"}`);
           }
-          case "generated-subtitles":
-            return mux.request("PUT", `${path(id)}/generated-subtitles`, {
-              generated_subtitles: news.generated_subtitles ?? [],
-            });
-          case "embedded-subtitles":
-            return mux.request("PUT", `${path(id)}/embedded-subtitles`, {
-              embedded_subtitles: news.embedded_subtitles ?? [],
-            });
-          case "enabled":
-            return mux.request("PUT", `${path(id)}/${news.enabled === false ? "disable" : "enable"}`);
-        }
-      };
+        });
 
       return {
         stables: ["id", "stream_key", "srt_passphrase", "rtmps_url", "srt_url"],
@@ -182,22 +251,21 @@ export const LiveStreamProvider = () =>
           ),
         diff: Effect.fn(function* ({ olds, news, output }) {
           if (output === undefined) return undefined;
-          const needed = plan(olds ?? {}, news as LiveStreamProps);
-          if (needed === "replace") return { action: "replace" } as const;
-          return needed.size > 0 ? ({ action: "update" } as const) : undefined;
+          const props = news as LiveStreamProps;
+          if (replaces(olds ?? {}, props)) return { action: "replace" } as const;
+          return propsChanged(olds ?? {}, props).length > 0 ? ({ action: "update" } as const) : undefined;
         }),
         reconcile: Effect.fn(function* ({ news, olds, output }) {
           if (output === undefined) {
             const { enabled, ...body } = news;
             const created = yield* mux.request<MuxLiveStream>("POST", "/video/v1/live-streams", body);
-            if (enabled === false) yield* apply(created.id, "enabled", news);
+            if (enabled === false) yield* write(created.id, { patch: {}, enabled: false });
             return toAttrs(yield* get(created.id));
           }
-          // Adopted streams have no prior props, so every path is applied.
-          const needed =
-            olds === undefined ? new Set(Object.values(APPLY)) : plan(olds, news);
-          if (needed === "replace") return yield* new LiveStreamImmutableChange({ id: output.id });
-          for (const how of needed) yield* apply(output.id, how, news);
+          if (olds !== undefined && replaces(olds, news)) {
+            return yield* new LiveStreamImmutableChange({ id: output.id });
+          }
+          yield* write(output.id, pending(news, yield* get(output.id)));
           // PATCH and PUT responses omit fields such as playback_ids, so re-read.
           return toAttrs(yield* get(output.id));
         }),

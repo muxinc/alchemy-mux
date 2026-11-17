@@ -67,6 +67,14 @@ export function stateOf(stack: string, stage: string, id: string): Record<string
   return unredact(JSON.parse(readFileSync(file, "utf8")).attr);
 }
 
+/** A resource's type and the props Alchemy last deployed (or attempted, after a failure). */
+export function rowOf(stack: string, stage: string, id: string): { type: string; props: Record<string, unknown> } | undefined {
+  const file = `.alchemy/state/${stack}/${stage}/${id}.json`;
+  if (!existsSync(file)) return undefined;
+  const row = JSON.parse(readFileSync(file, "utf8"));
+  return { type: row.resourceType, props: row.props ?? {} };
+}
+
 function unredact(value: any): any {
   if (Array.isArray(value)) return value.map(unredact);
   if (value && typeof value === "object") {

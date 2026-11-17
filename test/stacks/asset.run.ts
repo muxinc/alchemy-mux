@@ -4,7 +4,7 @@ import * as Mux from "../../src/index.ts";
 
 const run = process.env.MUX_TEST_RUN!;
 const phase = process.env.MUX_TEST_PHASE!;
-const phases = ["create", "update", "trim", "captions", "recaption", "badtrack", "redirect", "watermark", "reingest", "badinput"];
+const phases = ["create", "update", "trim", "captions", "recaption", "badtrack", "halfway", "revert", "drift", "unset", "redirect", "watermark", "reingest", "badinput"];
 const at = (name: string) => phases.indexOf(phase) >= phases.indexOf(name);
 const between = (from: string, to: string) => at(from) && !at(to);
 
@@ -49,13 +49,19 @@ export default Alchemy.Stack(
       test: true,
       video_quality: at("reingest") ? "plus" : "basic",
       passthrough: at("update") ? `${run}-v2` : run,
-      meta: { title: at("update") ? `verify ${run} v2` : `verify ${run}` },
+      ...(!between("unset", "redirect") && {
+        meta: {
+          title: phase === "halfway" ? `verify ${run} halfway` : at("update") ? `verify ${run} v2` : `verify ${run}`,
+        },
+      }),
       directives: [{ id: directive.id }],
       playback_policies: between("update", "trim")
         ? ["public", "signed"]
         : at("trim")
           ? ["signed"]
           : ["public"],
+      // Mux rejects this resolution, after the title change has been applied.
+      ...(phase === "halfway" && { static_renditions: [{ resolution: "999p" as "highest" }] }),
       ...(between("update", "trim") && {
         thumbnail_time: 2,
         master_access: "temporary" as const,

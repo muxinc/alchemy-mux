@@ -19,12 +19,12 @@ between betas.
 | Resource | Updates in place | Changing it creates a new one |
 | --- | --- | --- |
 | `Mux.Asset` | `passthrough`, `meta`, `thumbnail_time`, `master_access`, `static_renditions`, `playback_policies` (adds and removes playback IDs), `directives` (new ones run on the existing asset), text and audio tracks (`text` and `audio` inputs, and the first input's `generated_subtitles`) | the video input, a watermark (overlay) input, `video_quality`, `test` and other ingest settings (re-encodes) |
-| `Mux.LiveStream` | latency, reconnect window and slate, max duration, passthrough, title, `enabled`, live and embedded captions, `mp4_support` / `master_access` / `video_quality` of recordings | playback policies, `audio_only`, `test`, other recording settings (new stream key) |
+| `Mux.LiveStream` | latency, reconnect window and slate, max duration, passthrough, title, `enabled`, live and embedded captions, `mp4_support` / `master_access` / `video_quality` / `meta` of recordings | playback policies, `audio_only`, `test`, other recording settings (new stream key) |
 | `Mux.SimulcastTarget` | nothing | everything (Mux has no update endpoint) |
 | `Mux.TranscriptionVocabulary` | name, phrases, passthrough | nothing |
 | `Mux.Robots.Directive` | nothing | everything (Mux locks Directives at creation) |
 | `Mux.Webhook` | address, `enabled` | nothing. Also `Mux.Webhook.lookup({ address })` |
-| `Mux.Annotation` | nothing | everything. Add `RemovalPolicy.retain()` to keep old markers |
+| `Mux.Annotation` | nothing (drift repair puts back an edited note) | everything. Add `RemovalPolicy.retain()` to keep old markers |
 | `Mux.SigningKey` | nothing | nothing to configure |
 | `Mux.PlaybackRestriction` | referrer and user-agent rules | nothing |
 
@@ -60,8 +60,23 @@ Set `MUX_TOKEN_ID` and `MUX_TOKEN_SECRET`, or run `alchemy profile edit`.
 The token needs Video, System, Robots and Data write for the resources you
 use.
 
-A plain `alchemy deploy` trusts its state. Run `alchemy deploy --detect-drift`
-to recreate resources someone deleted in the dashboard.
+## Failed deploys and drift
+
+Updates compare the props with what Mux reports, not with the props of the
+last deploy. So when a deploy fails partway through an update, the next
+deploy finishes the change, or undoes it if you reverted the props. A setting
+removed from the props returns to Mux's default.
+
+A plain `alchemy deploy` trusts its state. `alchemy deploy --detect-drift`
+reads every resource from Mux, recreates the ones deleted in the dashboard,
+and puts back settings changed there: titles, metadata, latency, captions,
+playback IDs, master access, renditions, declared tracks, webhook addresses
+and annotation notes. Directive runs are events and are never repeated, and
+tracks added outside Alchemy are left alone.
+
+When a stream is finishing an interrupted update, Alchemy hides even its `id`
+from dependents, so the next deploy also recreates its simulcast targets
+with the same settings.
 
 ## Verify
 
@@ -87,16 +102,25 @@ counts as done. It runs these checks in order and stops at the first failure:
 
    Scenarios also cover:
    - conflicts and bad inputs that must fail with clear errors
-   - out-of-band deletes repaired by `--detect-drift`
+   - a deploy that fails partway through an update, then a deploy that
+     reverts the props and must put Mux back
+   - out-of-band deletes and edits repaired by `--detect-drift`
+   - removed settings returning to Mux's defaults
    - `RemovalPolicy.retain()`
    - bindings: tokens accepted by `stream.mux.com` and `image.mux.com`
      (403 without them), and webhook signatures cross-checked against the
      official `@mux/ts` SDK
 
    Destroy always runs, and every object the scenario created must then be
-   gone, or still present if it was retained.
+   gone, or still present if it was retained. After a phase that must fail,
+   state holds the last good props while Mux may be half-changed, so the
+   persisted-attributes check is skipped and the next phase must repair it.
 6. **Sweep.** Every Mux object type is listed, and nothing tagged with this
    run's ID may remain.
+7. **Coverage,** on full runs. Every prop a resource updates in place
+   (`AssetUpdatable` and `LiveStreamUpdatable` in the source, and the props
+   of webhooks, vocabularies and playback restrictions) must be changed by
+   some phase that plans an in-place update.
 
 CI runs every gate on each pull request and each push to `main`, one run at
 a time, with the `MUX_TOKEN_ID` and `MUX_TOKEN_SECRET` repository secrets.
@@ -118,6 +142,13 @@ same.
 - Live stream PATCH and PUT responses omit `playback_ids`, so the provider
   reads the stream again after updating it.
 - Playback IDs come back in no stable order, so the provider sorts them.
+- Live stream `meta` and recording `meta` ignore `{}`. A key is cleared by
+  sending it as an empty string. Live stream `meta` keeps only `title`.
+- Live stream `reconnect_window` is omitted when it is 0. It defaults to 60
+  for standard latency and 0 for reduced and low, and changing latency
+  does not change it.
+- Test live streams are fixed at `max_continuous_duration: 300`; other
+  streams default to 43200.
 - Annotations dated far in the past (for example, 2023) get a 500 instead of
   a 400.
 - Track names must be unique per asset, so a changed track is removed before
@@ -125,4 +156,6 @@ same.
   provider finds tracks by type, language and name.
 - A track with a bad URL errors while the asset stays `ready`.
 - Live streams reject `video_quality: "basic"`, test streams reject simulcast
-  targets, and low latency cannot be combined with live captions.
+  targets, and low latency cannot be combined with live or embedded
+  captions. Creating such a stream is rejected, but a PATCH to low latency
+  with embedded captions on is accepted.
