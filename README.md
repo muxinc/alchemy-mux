@@ -4,15 +4,9 @@ Mux resources and runtime bindings for [Alchemy](https://alchemy.run) v2.
 See `example/alchemy.run.ts` for a stack that uses all of them. That stack
 is deployed and destroyed by `bun run verify`.
 
-The package is not on npm yet. Once it is published:
-
-```sh
-npm install @mux/alchemy alchemy@2.0.0-beta.87 effect
-```
-
-The package ships compiled JavaScript for Node and the TypeScript source for
-Bun. It is pinned to one Alchemy beta, because Alchemy's API can change
-between betas.
+This package is not published, and Mux does not support it separately. It
+is intended to become an official Alchemy provider. It is pinned to
+`alchemy@2.0.0-beta.87`, because Alchemy's API can change between betas.
 
 ## Resources
 
