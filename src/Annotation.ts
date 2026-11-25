@@ -72,7 +72,8 @@ export const AnnotationProvider = () =>
             return yield* mux.request<AnnotationAttributes>("PATCH", path(output.id), {
               note: news.note,
               date: news.date ?? date,
-              ...(news.sub_property_id !== undefined && { sub_property_id: news.sub_property_id }),
+              // Mux clears a sub-property sent as "", so one added in the dashboard goes.
+              sub_property_id: news.sub_property_id ?? "",
             });
           }
           return yield* mux.request<AnnotationAttributes>("POST", "/data/v1/annotations", {

@@ -85,7 +85,9 @@ counts as done. It runs these checks in order and stops at the first failure:
    builds, and Node loads it through its `exports` map.
 4. **API client.** Against a local fake server: 429s retry and honor
    `Retry-After`, POSTs never retry after a 5xx, retries stop at the cap, 404
-   maps to `NotFound`, lists page, and auth is sent.
+   maps to `NotFound`, lists page, and auth is sent. Then the rule that pairs
+   wanted playback IDs with live ones, by policy and DRM configuration, is
+   checked directly, since a test environment has no DRM configuration.
 5. **Lifecycle, per scenario, against real Mux.** In every phase:
    - The plan Alchemy prints matches the expected create, update, replace or
      noop for each resource.

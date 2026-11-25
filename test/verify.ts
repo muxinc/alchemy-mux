@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clientChecks } from "./client.ts";
+import { convergeChecks } from "./converge.ts";
 import { sweep } from "./sweep.ts";
 import { AssetUpdatable, LiveStreamUpdatable } from "../src/index.ts";
 import { alchemy, check, CheckFailed, mux, rowOf, stateOf } from "./lib.ts";
@@ -245,6 +246,7 @@ try {
   await gate("3. typecheck", typecheck);
   await gate("3b. package builds and loads under Node through its exports map", packageBuild);
   await gate("4. API client behavior against a fake server", clientChecks);
+  await gate("4b. playback ID pairing rules", convergeChecks);
   for (const scenario of selected) {
     await gate(`5. lifecycle: ${scenario.name}`, () => lifecycle(scenario, runId));
   }

@@ -4,7 +4,7 @@ import { Resource } from "alchemy/Resource";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import { metaWrite } from "./Converge.ts";
+import { metaWrite, playbackIdChanges } from "./Converge.ts";
 import { listAll, Mux, playbackIdsByPolicy, type PlaybackIdsByPolicy, sortPlaybackIds } from "./Api.ts";
 import type { components } from "./generated/mux-api.ts";
 import type { Providers } from "./Providers.ts";
@@ -337,13 +337,11 @@ export const AssetProvider = () =>
               ...(news.playback_policies ?? []).map((policy) => ({ policy })),
               ...(news.advanced_playback_policies ?? []),
             ];
-            const current = asset.playback_ids ?? [];
-            for (const want of wanted) {
-              if (!current.some((p) => p.policy === want.policy)) {
-                yield* mux.request("POST", `${path(asset.id)}/playback-ids`, want);
-              }
+            const { create, remove } = playbackIdChanges(wanted, asset.playback_ids ?? []);
+            for (const want of create) {
+              yield* mux.request("POST", `${path(asset.id)}/playback-ids`, want);
             }
-            for (const id of current.filter((p) => !wanted.some((w) => w.policy === p.policy))) {
+            for (const id of remove) {
               yield* mux
                 .request("DELETE", `${path(asset.id)}/playback-ids/${id.id}`)
                 .pipe(Effect.catchTag("NotFound", () => Effect.void));
