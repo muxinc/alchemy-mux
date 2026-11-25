@@ -2,8 +2,10 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clientChecks } from "./client.ts";
+import { convergeChecks } from "./converge.ts";
 import { sweep } from "./sweep.ts";
-import { alchemy, check, CheckFailed, mux, stateOf } from "./lib.ts";
+import { AssetUpdatable, LiveStreamUpdatable } from "../src/index.ts";
+import { alchemy, check, CheckFailed, mux, rowOf, stateOf } from "./lib.ts";
 import type { Scenario } from "./scenario.ts";
 import { scenarios } from "./scenarios/index.ts";
 
@@ -82,6 +84,33 @@ async function packageBuild() {
   check(node.code === 0, `the built package does not load under Node:\n${node.output}`);
 }
 
+/**
+ * Props each resource changes without being replaced. Every one must be
+ * changed by some phase that plans an in-place update.
+ */
+const IN_PLACE: Record<string, Iterable<string>> = {
+  "Mux.Asset": AssetUpdatable,
+  "Mux.LiveStream": LiveStreamUpdatable,
+  "Mux.Webhook": ["address", "enabled"],
+  "Mux.TranscriptionVocabulary": ["name", "phrases", "passthrough"],
+  "Mux.PlaybackRestriction": ["referrer", "user_agent"],
+};
+/** Props with nothing in Mux to observe, so no phase can show their effect. */
+const NOT_OBSERVABLE: Record<string, string[]> = {
+  "Mux.Asset": ["wait_for_ready"],
+};
+const exercised = new Map<string, Set<string>>();
+
+function coverage() {
+  const missing = Object.entries(IN_PLACE).flatMap(([type, props]) =>
+    [...props]
+      .filter((p) => !exercised.get(type)?.has(p) && !NOT_OBSERVABLE[type]?.includes(p))
+      .map((p) => `${type}.${p}`),
+  );
+  check(missing.length === 0, `no phase updates these in place, so nothing proves they work: ${missing.join(", ")}`);
+  return `${Object.values(IN_PLACE).reduce((n, p) => n + [...p].length, 0)} props across ${Object.keys(IN_PLACE).length} resources`;
+}
+
 async function lifecycle(scenario: Scenario, runId: string) {
   const stage = `verify-${runId}`;
   process.env.VERIFY_STAGE = stage;
@@ -92,6 +121,23 @@ async function lifecycle(scenario: Scenario, runId: string) {
     Object.fromEntries(
       Object.keys(scenario.resources).map((id) => [id, stateOf(scenario.stack, stage, id)]),
     );
+
+  let lastProps: Record<string, Record<string, unknown> | undefined> = {};
+  const recordUpdates = (plan: Record<string, string>) => {
+    const now: typeof lastProps = {};
+    for (const id of Object.keys(scenario.resources)) {
+      const row = rowOf(scenario.stack, stage, id);
+      now[id] = row?.props;
+      if (!row || plan[id] !== "update" || !lastProps[id]) continue;
+      const before = lastProps[id]!;
+      const keys = new Set([...Object.keys(before), ...Object.keys(row.props)]);
+      const changed = [...keys].filter((k) => JSON.stringify(before[k]) !== JSON.stringify(row.props[k]));
+      const set = exercised.get(row.type) ?? new Set();
+      changed.forEach((k) => set.add(k));
+      exercised.set(row.type, set);
+    }
+    lastProps = now;
+  };
 
   let failure: unknown;
   try {
@@ -120,14 +166,19 @@ async function lifecycle(scenario: Scenario, runId: string) {
             `${label}: plan was ${JSON.stringify(deploy.plan)}, expected ${JSON.stringify(phase.plan)}`,
           );
         }
+        recordUpdates(phase.failsWith ? {} : deploy.plan);
         const state = snapshot();
         for (const [id, attrs] of Object.entries(state)) {
           if (attrs) seen.set(scenario.resources[id](attrs), { origin: `${label}:${id}`, id, attrs });
         }
         try {
           await phase.verify?.({ run: runId, state, previous });
-          for (const [id, attrs] of Object.entries(state)) {
-            if (attrs) await scenario.matchesMux?.[id]?.(attrs);
+          // After a failed deploy, state holds the last good props while Mux may
+          // hold a half-applied change; the next phase must repair it.
+          if (!phase.failsWith) {
+            for (const [id, attrs] of Object.entries(state)) {
+              if (attrs) await scenario.matchesMux?.[id]?.(attrs);
+            }
           }
         } catch (error) {
           if (error instanceof CheckFailed) throw new CheckFailed(`${label}: ${error.message}`);
@@ -195,10 +246,14 @@ try {
   await gate("3. typecheck", typecheck);
   await gate("3b. package builds and loads under Node through its exports map", packageBuild);
   await gate("4. API client behavior against a fake server", clientChecks);
+  await gate("4b. playback ID pairing rules", convergeChecks);
   for (const scenario of selected) {
     await gate(`5. lifecycle: ${scenario.name}`, () => lifecycle(scenario, runId));
   }
   await gate("6. sweep: nothing from this run remains in Mux", () => sweep(runId));
+  if (selected.length === scenarios.length) {
+    await gate("7. every in-place update is exercised by a phase", async () => coverage());
+  }
   console.log(`\nALL ${results.length} GATES PASSED`);
 } catch (error) {
   if (!(error instanceof CheckFailed)) console.error(error);

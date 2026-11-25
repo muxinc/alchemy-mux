@@ -4,6 +4,7 @@ import { Resource } from "alchemy/Resource";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import { metaWrite, playbackIdChanges } from "./Converge.ts";
 import { listAll, Mux, playbackIdsByPolicy, type PlaybackIdsByPolicy, sortPlaybackIds } from "./Api.ts";
 import type { components } from "./generated/mux-api.ts";
 import type { Providers } from "./Providers.ts";
@@ -48,6 +49,12 @@ export type Asset = Resource<"Mux.Asset", AssetProps, AssetAttributes, never, Pr
  * `generated_subtitles`. Any other change, including the video input or a
  * watermark (overlay) input, creates a new asset, which means ingesting and
  * encoding the video again.
+ *
+ * Updates compare the props with the asset as Mux reports it, so a deploy
+ * after a failed one finishes or reverts the half-applied change, and
+ * `alchemy deploy --detect-drift` repairs settings changed outside Alchemy,
+ * including declared tracks deleted outside it. Playback IDs are managed
+ * only when `playback_policies` or `advanced_playback_policies` is set.
  *
  * A removed track is found by its type, language and name, because Mux does
  * not report a track's source URL. Give tracks that share a type and
@@ -114,32 +121,32 @@ export class AssetImmutableChange extends Data.TaggedError("AssetImmutableChange
   }
 }
 
-/** How a change to each field reaches Mux. Fields not listed force a replacement. */
-const APPLY = {
-  passthrough: "patch",
-  meta: "patch",
-  thumbnail_time: "patch",
-  master_access: "master-access",
-  static_renditions: "static-renditions",
-  playback_policies: "playback-ids",
-  directives: "directives",
-  inputs: "tracks",
-  wait_for_ready: "nothing",
-} as const satisfies Partial<Record<keyof AssetProps, string>>;
+/**
+ * Props Mux can change on an existing asset. Changing any other prop, or
+ * the video and watermark inputs, creates a new asset.
+ */
+export const AssetUpdatable: ReadonlySet<string> = new Set([
+  "passthrough",
+  "meta",
+  "thumbnail_time",
+  "master_access",
+  "static_renditions",
+  "playback_policies",
+  "directives",
+  "inputs",
+  "wait_for_ready",
+] satisfies (keyof AssetProps)[]);
 
-type Applied = (typeof APPLY)[keyof typeof APPLY];
-
-const plan = (olds: AssetProps, news: AssetProps): Set<Applied> | "replace" => {
-  const needed = new Set<Applied>();
+const plan = (olds: AssetProps, news: AssetProps): "replace" | "update" | undefined => {
+  let action: "update" | undefined;
   const keys = new Set([...Object.keys(olds), ...Object.keys(news)]) as Set<keyof AssetProps>;
   for (const key of keys) {
     if (isResolved(news[key]) && deepEqual(olds[key], news[key])) continue;
+    if (!AssetUpdatable.has(key)) return "replace";
     if (key === "inputs" && !sameSource(olds.inputs, news.inputs)) return "replace";
-    const how = APPLY[key as keyof typeof APPLY];
-    if (how === undefined) return "replace";
-    needed.add(how);
+    action = "update";
   }
-  return needed;
+  return action;
 };
 
 const isTrack = (input: Input) => input.type === "text" || input.type === "audio";
@@ -260,14 +267,15 @@ export const AssetProvider = () =>
             }
           }
 
-          // An adopted asset may already have a declared track; keep it.
-          const isNew = (matches: (t: Track) => boolean) => {
-            const present = olds === undefined ? unclaimed(matches)[0] : undefined;
+          // Every declared track Mux does not have is added, so a track deleted
+          // outside Alchemy, or lost to an interrupted deploy, comes back.
+          const missing = (matches: (t: Track) => boolean) => {
+            const present = unclaimed(matches)[0];
             if (present) claimed.add(present.id!);
             return present === undefined;
           };
-          const addedInputs = without(after.tracks, before.tracks).filter((i) => isNew(matchesInput(i)));
-          const addedSubtitles = without(after.subtitles, before.subtitles).filter((s) => isNew(matchesGenerated(s)));
+          const addedInputs = after.tracks.filter((i) => missing(matchesInput(i)));
+          const addedSubtitles = after.subtitles.filter((s) => missing(matchesGenerated(s)));
 
           const removed: Effect.Effect<unknown, unknown>[] = [];
           const added: Track[] = [];
@@ -303,71 +311,65 @@ export const AssetProvider = () =>
           );
         });
 
-      const apply = (asset: MuxAsset, how: Applied, olds: AssetProps | undefined, news: AssetProps) =>
+      /** Brings the asset to what `news` describes, comparing with Mux rather than with `olds`. */
+      const converge = (asset: MuxAsset, olds: AssetProps | undefined, news: AssetProps) =>
         Effect.gen(function* () {
-          switch (how) {
-            case "nothing":
-              return;
-            case "patch": {
-              yield* mux.request("PATCH", path(asset.id), {
-                passthrough: news.passthrough ?? "",
-                meta: news.meta ?? {},
-                ...(news.thumbnail_time !== undefined && { thumbnail_time: news.thumbnail_time }),
-              });
-              if (news.thumbnail_time === undefined && asset.thumbnail_time !== undefined) {
-                yield* mux.request("DELETE", `${path(asset.id)}/thumbnail-time`);
-              }
-              return;
+          const patch: Record<string, unknown> = {};
+          if ((news.passthrough ?? "") !== (asset.passthrough ?? "")) patch.passthrough = news.passthrough ?? "";
+          const meta = metaWrite(news.meta, asset.meta);
+          if (meta) patch.meta = meta;
+          if (news.thumbnail_time !== undefined && news.thumbnail_time !== asset.thumbnail_time) {
+            patch.thumbnail_time = news.thumbnail_time;
+          }
+          if (Object.keys(patch).length > 0) yield* mux.request("PATCH", path(asset.id), patch);
+          if (news.thumbnail_time === undefined && asset.thumbnail_time !== undefined) {
+            yield* mux.request("DELETE", `${path(asset.id)}/thumbnail-time`);
+          }
+
+          const masterAccess = news.master_access ?? "none";
+          if (masterAccess !== (asset.master_access ?? "none")) {
+            yield* mux.request("PUT", `${path(asset.id)}/master-access`, { master_access: masterAccess });
+          }
+
+          // Playback IDs are managed only when the props declare policies.
+          if (news.playback_policies !== undefined || news.advanced_playback_policies !== undefined) {
+            const wanted = [
+              ...(news.playback_policies ?? []).map((policy) => ({ policy })),
+              ...(news.advanced_playback_policies ?? []),
+            ];
+            const { create, remove } = playbackIdChanges(wanted, asset.playback_ids ?? []);
+            for (const want of create) {
+              yield* mux.request("POST", `${path(asset.id)}/playback-ids`, want);
             }
-            case "master-access":
-              yield* mux.request("PUT", `${path(asset.id)}/master-access`, {
-                master_access: news.master_access ?? "none",
-              });
-              return;
-            case "static-renditions": {
-              const desired = news.static_renditions ?? [];
-              const existing = (asset.static_renditions?.files ?? []).filter((f) => f.id);
-              for (const rendition of desired) {
-                if (!existing.some((f) => f.resolution === rendition.resolution)) {
-                  yield* mux.request("POST", `${path(asset.id)}/static-renditions`, rendition);
-                }
-              }
-              for (const file of existing) {
-                if (!desired.some((r) => r.resolution === file.resolution)) {
-                  yield* mux
-                    .request("DELETE", `${path(asset.id)}/static-renditions/${file.id}`)
-                    .pipe(Effect.catchTag("NotFound", () => Effect.void));
-                }
-              }
-              return;
+            for (const id of remove) {
+              yield* mux
+                .request("DELETE", `${path(asset.id)}/playback-ids/${id.id}`)
+                .pipe(Effect.catchTag("NotFound", () => Effect.void));
             }
-            case "playback-ids": {
-              const desired = news.playback_policies ?? [];
-              const current = asset.playback_ids ?? [];
-              for (const policy of desired) {
-                if (!current.some((p) => p.policy === policy)) {
-                  yield* mux.request("POST", `${path(asset.id)}/playback-ids`, { policy });
-                }
-              }
-              // Only remove policies this resource declared before, so playback
-              // IDs added elsewhere (or via advanced_playback_policies) survive.
-              const dropped = (olds?.playback_policies ?? []).filter((p) => !desired.includes(p));
-              for (const id of current.filter((p) => dropped.includes(p.policy!))) {
-                yield* mux
-                  .request("DELETE", `${path(asset.id)}/playback-ids/${id.id}`)
-                  .pipe(Effect.catchTag("NotFound", () => Effect.void));
-              }
-              return;
+          }
+
+          const desired = news.static_renditions ?? [];
+          const existing = (asset.static_renditions?.files ?? []).filter((f) => f.id);
+          for (const rendition of desired) {
+            if (!existing.some((f) => f.resolution === rendition.resolution)) {
+              yield* mux.request("POST", `${path(asset.id)}/static-renditions`, rendition);
             }
-            case "directives": {
-              const before = directiveIds(olds);
-              for (const id of directiveIds(news).filter((d) => !before.includes(d))) {
-                yield* mux.request("POST", `/robots/v1/directives/${id}/runs`, { asset_id: asset.id });
-              }
-              return;
+          }
+          for (const file of existing.filter((f) => !desired.some((r) => r.resolution === f.resolution))) {
+            yield* mux
+              .request("DELETE", `${path(asset.id)}/static-renditions/${file.id}`)
+              .pipe(Effect.catchTag("NotFound", () => Effect.void));
+          }
+
+          yield* applyTracks(asset, olds, news);
+
+          // Runs are events, not state: only newly listed Directives start one,
+          // and an adopted asset starts none.
+          if (olds !== undefined) {
+            const before = directiveIds(olds);
+            for (const id of directiveIds(news).filter((d) => !before.includes(d))) {
+              yield* mux.request("POST", `/robots/v1/directives/${id}/runs`, { asset_id: asset.id });
             }
-            case "tracks":
-              return yield* applyTracks(asset, olds, news);
           }
         });
 
@@ -377,9 +379,8 @@ export const AssetProvider = () =>
           listAll<MuxAsset>(mux, "/video/v1/assets").pipe(Effect.map((assets) => assets.map(toAttrs))),
         diff: Effect.fn(function* ({ olds, news, output }) {
           if (output === undefined) return undefined;
-          const needed = plan(olds ?? {}, news as AssetProps);
-          if (needed === "replace") return { action: "replace" } as const;
-          return needed.size > 0 ? ({ action: "update" } as const) : undefined;
+          const action = plan(olds ?? {}, news as AssetProps);
+          return action === undefined ? undefined : ({ action } as const);
         }),
         reconcile: Effect.fn(function* ({ news, olds, output }) {
           if (output === undefined) {
@@ -391,15 +392,10 @@ export const AssetProvider = () =>
             }
             return toAttrs(thumbnail_time === undefined ? ready : yield* get(created.id));
           }
-          // Adopted assets have no prior props: apply every setting, but do not
-          // start Directive runs (they cost money and may have already run).
-          const needed =
-            olds === undefined
-              ? new Set(Object.values(APPLY).filter((how) => how !== "directives"))
-              : plan(olds, news);
-          if (needed === "replace") return yield* new AssetImmutableChange({ id: output.id });
-          const current = yield* get(output.id);
-          for (const how of needed) yield* apply(current, how, olds, news);
+          if (olds !== undefined && plan(olds, news) === "replace") {
+            return yield* new AssetImmutableChange({ id: output.id });
+          }
+          yield* converge(yield* get(output.id), olds, news);
           return toAttrs(yield* get(output.id));
         }),
         delete: Effect.fn(function* ({ output }) {

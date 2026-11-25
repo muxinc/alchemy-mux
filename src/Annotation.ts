@@ -29,7 +29,8 @@ export type Annotation = Resource<
  * A marker on Mux Data charts, so a change in rebuffering or startup time can
  * be lined up with what shipped. An annotation marks a moment: changing any
  * prop creates a new one. Add `RemovalPolicy.retain()` to keep each old
- * marker as release history.
+ * marker as release history. `alchemy deploy --detect-drift` puts back a
+ * note edited in the dashboard.
  * @see https://www.mux.com/docs/guides/annotations
  *
  * **Example:** Mark every release on Mux Data
@@ -59,7 +60,22 @@ export const AnnotationProvider = () =>
           return deepEqual(olds, news) ? undefined : ({ action: "replace" } as const);
         }),
         reconcile: Effect.fn(function* ({ news, output }) {
-          if (output !== undefined) return output;
+          if (output !== undefined) {
+            // Only drift repair reaches here (any prop change replaces), with
+            // `output` as Mux reports it: put back a note edited in the dashboard.
+            const date = Math.floor(Date.parse(output.date) / 1000);
+            const drifted =
+              output.note !== news.note ||
+              (output.sub_property_id ?? undefined) !== news.sub_property_id ||
+              (news.date !== undefined && date !== news.date);
+            if (!drifted) return output;
+            return yield* mux.request<AnnotationAttributes>("PATCH", path(output.id), {
+              note: news.note,
+              date: news.date ?? date,
+              // Mux clears a sub-property sent as "", so one added in the dashboard goes.
+              sub_property_id: news.sub_property_id ?? "",
+            });
+          }
           return yield* mux.request<AnnotationAttributes>("POST", "/data/v1/annotations", {
             ...news,
             date: news.date ?? Math.floor(Date.now() / 1000),

@@ -46,5 +46,30 @@ export const annotation_: Scenario = {
         check(oldKept.status === 200, "RemovalPolicy.retain() did not keep the previous marker");
       },
     },
+    {
+      name: "drift",
+      detectDrift: true,
+      plan: { marker: "update", pinned: "update", kept: "noop" },
+      before: async ({ previous }) => {
+        for (const id of ["marker", "pinned"]) {
+          const a = previous[id]!;
+          const r = await mux("PATCH", `/data/v1/annotations/${a.id}`, {
+            note: "changed outside alchemy",
+            date: Math.floor(Date.parse(a.date) / 1000) - 3600,
+            sub_property_id: "added-outside-alchemy",
+          });
+          check(r.status === 200, `out-of-band PATCH returned ${r.status}`);
+        }
+      },
+      verify: async ({ run, state, previous }) => {
+        check(state.marker!.id === previous.marker!.id, "drift repair replaced the marker");
+        const marker = await annotation(state.marker!.id);
+        check(marker.note === `verify ${run} v2`, `drifted note not repaired: ${marker.note}`);
+        check(!marker.sub_property_id, `sub-property added outside Alchemy not cleared: ${marker.sub_property_id}`);
+        const pinned = await annotation(state.pinned!.id);
+        check(pinned.note === `verify ${run} pinned`, `drifted pinned note not repaired: ${pinned.note}`);
+        check(Date.parse(pinned.date) / 1000 === pinnedDate(run), `drifted pinned date not repaired: ${pinned.date}`);
+      },
+    },
   ],
 };
