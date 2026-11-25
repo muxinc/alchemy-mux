@@ -5,15 +5,21 @@ import * as Mux from "../../src/index.ts";
 
 const run = process.env.MUX_TEST_RUN!;
 const phase = process.env.MUX_TEST_PHASE!;
-const phases = ["create", "update", "reenable", "retitle", "retarget", "replace"];
+const phases = [
+  "create", "update", "reenable", "retitle", "slate", "halfway", "revert", "drift", "unset", "caption", "plaincaption", "lowlatency",
+  "retarget", "replace",
+];
 const at = (name: string) => phases.indexOf(phase) >= phases.indexOf(name);
+const between = (from: string, to: string) => at(from) && !at(to);
+const SLATE = "https://muxed.s3.amazonaws.com/example-watermark.png";
 
 export default Alchemy.Stack(
   "MuxVerifyLiveStream",
   { providers: Mux.providers(), state: Alchemy.localState() },
   Effect.gen(function* () {
     const vocab = yield* Mux.TranscriptionVocabulary("vocab", {
-      name: `verify ${run}`,
+      name: at("update") ? `verify ${run} v2` : `verify ${run}`,
+      passthrough: at("update") ? `${run}-v2` : run,
       phrases: at("update") ? ["Alchemy", "Mux", run] : ["Alchemy"],
     });
 
@@ -21,23 +27,30 @@ export default Alchemy.Stack(
       playback_policies: at("replace") ? ["signed"] : ["public"],
       // Not a test stream: Mux rejects simulcast targets on test streams. It never receives video.
       test: false,
-      passthrough: run,
-      latency_mode: at("update") ? "reduced" : "low",
+      passthrough: at("retitle") ? `${run}-v3` : run,
+      latency_mode: phase === "halfway" || at("lowlatency") ? "low" : at("update") ? "reduced" : "low",
       meta: { title: at("retitle") ? `verify ${run} v3` : at("update") ? `verify ${run} v2` : `verify ${run}` },
       new_asset_settings: {
         playback_policies: ["public"],
         video_quality: at("update") ? "premium" : "plus",
+        ...(between("slate", "unset") && { meta: { title: `recording ${run}` } }),
       },
-      ...(at("update") && {
-        reconnect_window: 30,
+      ...(between("slate", "unset") && {
+        use_slate_for_standard_latency: true,
+        reconnect_slate_url: SLATE,
+        max_continuous_duration: 3600,
+      }),
+      ...(between("update", "unset") && { reconnect_window: 30 }),
+      ...(between("update", "lowlatency") && {
         embedded_subtitles: [{ language_code: "en", language_channel: "cc1" as const }],
       }),
-      ...(phase === "update" && {
-        enabled: false,
+      ...(phase === "update" && { enabled: false }),
+      ...(["update", "halfway", "caption"].includes(phase) && {
         generated_subtitles: [
-          { language_code: "en" as const, transcription_vocabulary_ids: [vocab.id] },
+          { language_code: "en" as const, transcription_vocabulary_ids: [vocab.id], passthrough: run },
         ],
       }),
+      ...(phase === "plaincaption" && { generated_subtitles: [{ language_code: "en" as const }] }),
     });
 
     const target = yield* Mux.SimulcastTarget("target", {
